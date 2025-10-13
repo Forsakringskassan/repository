@@ -33,16 +33,10 @@ docker run -d \
 
 In this case, you can browse to it at http://localhost:8080/
 
-List running apps with:
+Stop all running apps with:
 
 ```sh
-docker ps
-```
-
-Stop a running app with:
-
-```sh
-docker stop <CONTAINER I>
+docker stop $(docker ps -q)
 ```
 
 To cleanup all Docker stuff, do:
