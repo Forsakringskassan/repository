@@ -26,9 +26,21 @@ echo $GITHUB_TOKEN | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
 And run an image like:
 
 ```sh
-docker run \
+docker run -d \
   -p 8080:80 \
   ghcr.io/forsakringskassan/designsystem-user-app:snapshot
 ```
 
 In this case, you can browse to it at http://localhost:8080/
+
+List running apps with:
+
+```sh
+docker ps
+```
+
+Stop a running app with:
+
+```sh
+docker stop <CONTAINER I>
+```
