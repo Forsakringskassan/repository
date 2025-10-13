@@ -44,3 +44,9 @@ Stop a running app with:
 ```sh
 docker stop <CONTAINER I>
 ```
+
+To cleanup all Docker stuff, do:
+
+```sh
+docker system prune -a --volumes
+```
