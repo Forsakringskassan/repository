@@ -33,6 +33,12 @@ docker run -d \
 
 In this case, you can browse to it at http://localhost:8080/
 
+View logs with:
+
+```sh
+docker ps -q | xargs -n 1 -I {} docker logs -f {}
+```
+
 Stop all running apps with:
 
 ```sh
