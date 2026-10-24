@@ -1,0 +1,140 @@
+name: Maven intake
+
+# Hämtar Maven-artefakter som ett biblioteksrepo lagt på sin GitHub Release
+# (maven-staging.tar.gz) och publicerar dem till detta repos GitHub Packages
+# med repots egen GITHUB_TOKEN. Ingen lagrad hemlighet behövs.
+#
+# Körs manuellt:
+#   gh workflow run maven-intake.yaml -R Forsakringskassan/repository \
+#     -f repo=rimfrost-framework-handlaggning-adapter -f tag=1.2.5
+#
+# Idempotent: versioner som redan finns hoppas över, så intaget kan köras om.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Källrepo i Forsakringskassan, t.ex. rimfrost-framework-handlaggning-adapter"
+        required: true
+        type: string
+      tag:
+        description: "Releasens tagg, t.ex. 1.2.5"
+        required: true
+        type: string
+
+  permissions:
+    contents: read
+    packages: write
+
+  concurrency:
+    group: maven-intake
+    cancel-in-progress: false
+
+  env:
+    OWNER: Forsakringskassan
+    TARGET_URL: https://maven.pkg.github.com/Forsakringskassan/repository
+    ALLOWED_GROUP_PATH: se/fk/
+
+  jobs:
+    intake:
+      runs-on: ubuntu-latest
+      steps:
+        - name: Validate input
+          env:
+            REPO: ${{ inputs.repo }}
+            TAG: ${{ inputs.tag }}
+          run: |
+            [[ "$REPO" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::Ogiltigt reponamn"; exit 1; }
+            [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::Ogiltig tagg"; exit 1; }
+
+        - uses: actions/setup-java@v6
+          with:
+            distribution: "zulu"
+            java-version: "25"
+
+        - name: Check Maven
+          run: mvn -v
+
+        - name: Download staging from release
+          env:
+            GH_TOKEN: ${{ github.token }}
+            REPO: ${{ inputs.repo }}
+            TAG: ${{ inputs.tag }}
+          run: |
+            mkdir -p "$RUNNER_TEMP/in" "$RUNNER_TEMP/repo"
+            gh release download "$TAG" -R "$OWNER/$REPO" -p maven-staging.tar.gz -D "$RUNNER_TEMP/in"
+            tar -xzf "$RUNNER_TEMP/in/maven-staging.tar.gz" -C "$RUNNER_TEMP/repo"
+
+        - name: Check contents
+          run: |
+            cd "$RUNNER_TEMP/repo"
+            poms="$(find . -type f -name '*.pom')"
+            [ -n "$poms" ] || { echo "::error::Inga pom-filer i staging"; exit 1; }
+            outside="$(find . -type f -name '*.pom' ! -path "./$ALLOWED_GROUP_PATH*")"
+            if [ -n "$outside" ]; then
+              echo "::error::Artefakter utanför tillåtet groupId-prefix:"
+              echo "$outside"
+              exit 1
+            fi
+            echo "$poms"
+
+        - name: Create settings.xml
+          run: |
+            cat <<'EOF' > "$RUNNER_TEMP/settings.xml"
+            <?xml version="1.0" encoding="UTF-8"?>
+            <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+              <servers>
+                <server>
+                  <id>intake</id>
+                  <username>${env.GITHUB_ACTOR}</username>
+                  <password>${env.GITHUB_TOKEN}</password>
+                </server>
+              </servers>
+            </settings>
+            EOF
+
+        - name: Deploy to GitHub Packages
+          env:
+            GITHUB_ACTOR: ${{ github.actor }}
+            GITHUB_TOKEN: ${{ github.token }}
+          run: |
+            cd "$RUNNER_TEMP/repo"
+            while read -r pom; do
+              pom="${pom#./}"
+              dir="$(dirname "$pom")"
+              base="$(basename "$pom" .pom)"  # <artifactId>-<version>
+
+              status="$(curl -s -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer $GITHUB_TOKEN" "$TARGET_URL/$pom")"
+              if [ "$status" = "200" ]; then
+                echo "Finns redan, hoppar över: $pom"
+                continue
+              fi
+
+              main="$pom"; files=(); classifiers=(); types=()
+              for f in "$dir/$base".* "$dir/$base"-*; do
+                [ -f "$f" ] || continue
+                name="$(basename "$f")"
+                case "$name" in
+                  *.pom|*.sha1|*.md5|*.sha256|*.sha512|*.asc) continue ;;
+                esac
+                if [[ "$name" == "$base."* ]]; then main="$f"; continue; fi
+                rest="${name#"$base"-}"   # t.ex. sources.jar
+                classifiers+=("${rest%%.*}")
+                types+=("${rest#*.}")
+                files+=("$f")
+              done
+
+              args=(-B -ntp -s "$RUNNER_TEMP/settings.xml"
+                org.apache.maven.plugins:maven-deploy-plugin:3.1.2:deploy-file
+                -Durl="$TARGET_URL" -DrepositoryId=intake
+                -DpomFile="$pom" -Dfile="$main")
+              if [ ${#files[@]} -gt 0 ]; then
+                args+=(-Dfiles="$(IFS=,; echo "${files[*]}")"
+                       -Dclassifiers="$(IFS=,; echo "${classifiers[*]}")"
+                       -Dtypes="$(IFS=,; echo "${types[*]}")")
+              fi
+
+              echo "Publicerar $pom"
+              mvn "${args[@]}"
+            done < <(find . -type f -name '*.pom' | sort)
