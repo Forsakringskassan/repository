@@ -116,7 +116,8 @@ jobs:
               [ -f "$f" ] || continue
               name="$(basename "$f")"
               case "$name" in
-                *.pom|*.sha1|*.md5|*.sha256|*.sha512|*.asc) continue ;;
+                # .module är Gradle Module Metadata. Konsumenter faller tillbaka på pom-filen.
+                *.pom|*.module|*.sha1|*.md5|*.sha256|*.sha512|*.asc) continue ;;
               esac
               if [[ "$name" == "$base."* ]]; then main="$f"; continue; fi
               rest="${name#"$base"-}"          # t.ex. sources.jar
