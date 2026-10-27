@@ -17,7 +17,7 @@ name: Maven intake (schemalagt)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       since-hours:
@@ -48,7 +48,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: Forsakringskassan
-          SINCE_HOURS: ${{ inputs.since-hours || '2' }}
+          SINCE_HOURS: ${{ inputs.since-hours || '3' }}
           REPO_FILTER: ${{ inputs.repo-filter || '^rimfrost-' }}
         run: |
           [[ "$SINCE_HOURS" =~ ^[0-9]+$ ]] || { echo "::error::Ogiltigt antal timmar"; exit 1; }
