@@ -4,7 +4,7 @@ name: Maven intake
 # (maven-staging.tar.gz) och publicerar dem till detta repos GitHub Packages
 # med repots egen GITHUB_TOKEN. Ingen lagrad hemlighet behövs.
 #
-# Körs manuellt:
+# Körs automatiskt av maven-intake-schedule.yaml, eller manuellt:
 #   gh workflow run maven-intake.yaml -R Forsakringskassan/repository \
 #     -f repo=rimfrost-framework-handlaggning-adapter -f tag=1.2.5
 #
@@ -21,13 +21,23 @@ on:
         description: "Releasens tagg, t.ex. 1.2.5"
         required: true
         type: string
+  # Anropas av maven-intake-schedule.yaml för varje ny release.
+  workflow_call:
+    inputs:
+      repo:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
 
 permissions:
   contents: read
   packages: write
 
+# Per release: olika releaser tas in parallellt, samma release en i taget.
 concurrency:
-  group: maven-intake
+  group: maven-intake-${{ inputs.repo }}-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
@@ -46,6 +56,23 @@ jobs:
         run: |
           [[ "$REPO" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::Ogiltigt reponamn"; exit 1; }
           [[ "$TAG"  =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::Ogiltig tagg"; exit 1; }
+
+      # Bara tillgångar som ett workflow har laddat upp godtas. En fil som en
+      # person har laddat upp för hand avvisas. Det fulla skyddet är verifiering
+      # av attesteringar, som kommer senare.
+      - name: Check uploader
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ inputs.repo }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          uploader="$(gh api "repos/$OWNER/$REPO/releases/tags/$TAG" \
+            --jq '.assets[] | select(.name == "maven-staging.tar.gz") | .uploader.login')"
+          echo "Uppladdad av: ${uploader:-okänd}"
+          if [ "$uploader" != "github-actions[bot]" ]; then
+            echo "::error::maven-staging.tar.gz i $REPO $TAG är inte uppladdad av ett workflow (uppladdare: ${uploader:-saknas})"
+            exit 1
+          fi
 
       - uses: actions/setup-java@v6
         with:
@@ -106,10 +133,18 @@ jobs:
 
             status="$(curl -s -o /dev/null -w '%{http_code}' \
               -H "Authorization: Bearer $GITHUB_TOKEN" "$TARGET_URL/$pom")"
-            if [ "$status" = "200" ]; then
-              echo "Finns redan, hoppar över: $pom"
-              continue
-            fi
+            echo "Kontroll av $pom: HTTP $status"
+            case "$status" in
+              200|301|302|303|307|308)
+                echo "Finns redan, hoppar över: $pom"
+                continue
+                ;;
+              404) ;;
+              *)
+                echo "::error::Oväntat svar ($status) vid kontroll av $pom"
+                exit 1
+                ;;
+            esac
 
             main="$pom"; files=(); classifiers=(); types=()
             for f in "$dir/$base".* "$dir/$base"-*; do

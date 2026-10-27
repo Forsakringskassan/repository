@@ -1,0 +1,125 @@
+name: Maven intake (schemalagt)
+
+# Letar var 15:e minut efter releaser i organisationen som har en
+# maven-staging.tar.gz och publicerats den senaste tiden, och kör
+# maven-intake.yaml för var och en. Intaget hoppar över versioner som redan
+# finns, så det gör inget om samma release ses i flera körningar.
+#
+# Ingen behöver starta intaget för hand, och ingen utanför plattformen behöver
+# skrivrätt i detta repo.
+#
+# Bara repon vars namn matchar REPO_FILTER blir källor. Utöka filtret när nya
+# team ansluts. På sikt ersätts det av custom propertyn "team" och av
+# verifiering av attesteringar.
+#
+# Obs: GitHub stänger av schemalagda workflows efter 60 dagar utan aktivitet i
+# repot. Starta workflowet manuellt eller gör en commit om det har stängts av.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      since-hours:
+        description: "Ta in releaser publicerade de senaste N timmarna"
+        required: true
+        default: "2"
+      repo-filter:
+        description: "Regex på reponamn som får vara källor"
+        required: true
+        default: "^rimfrost-"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maven-intake-schedule
+  cancel-in-progress: false
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    outputs:
+      releases: ${{ steps.find.outputs.releases }}
+      count: ${{ steps.find.outputs.count }}
+    steps:
+      - name: Find new releases with Maven staging
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: Forsakringskassan
+          SINCE_HOURS: ${{ inputs.since-hours || '2' }}
+          REPO_FILTER: ${{ inputs.repo-filter || '^rimfrost-' }}
+        run: |
+          [[ "$SINCE_HOURS" =~ ^[0-9]+$ ]] || { echo "::error::Ogiltigt antal timmar"; exit 1; }
+          cutoff="$(date -u -d "-${SINCE_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Letar efter releaser publicerade efter $cutoff"
+
+          # En GraphQL-fråga per 50 repon, i stället för ett anrop per repo.
+          # $owner, $endCursor och $repo är variabler i GraphQL och jq, inte i
+          # skalet, och ska inte expanderas.
+          # shellcheck disable=SC2016
+          gh api graphql --paginate -F owner="$OWNER" -f query='
+            query($owner: String!, $endCursor: String) {
+              organization(login: $owner) {
+                repositories(first: 50, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    name
+                    isArchived
+                    releases(first: 5, orderBy: {field: CREATED_AT, direction: DESC}) {
+                      nodes {
+                        tagName
+                        publishedAt
+                        isDraft
+                        releaseAssets(first: 20) { nodes { name } }
+                      }
+                    }
+                  }
+                }
+              }
+            }' --jq '
+            .data.organization.repositories.nodes[]
+            | select(.isArchived | not)
+            | .name as $repo
+            | .releases.nodes[]
+            | select((.isDraft | not) and .publishedAt != null)
+            | select([.releaseAssets.nodes[].name] | index("maven-staging.tar.gz"))
+            | [$repo, .tagName, .publishedAt] | @tsv' > "$RUNNER_TEMP/candidates.tsv"
+
+          # Bara tillåtna repon, och bara releaser efter gränsen.
+          # ISO 8601-tider i UTC går att jämföra som text.
+          echo "Tillåtna repon: $REPO_FILTER"
+          awk -F'\t' -v c="$cutoff" -v re="$REPO_FILTER" '$1 ~ re && $3 > c { print $1 "\t" $2 }' \
+            "$RUNNER_TEMP/candidates.tsv" > "$RUNNER_TEMP/new.tsv"
+          ignored="$(awk -F'\t' -v c="$cutoff" -v re="$REPO_FILTER" '$1 !~ re && $3 > c { print $1 "\t" $2 }' "$RUNNER_TEMP/candidates.tsv")"
+          if [ -n "$ignored" ]; then
+            echo "::warning::Releaser med maven-staging i repon utanför filtret ignoreras:"
+            echo "$ignored"
+          fi
+
+          count="$(wc -l < "$RUNNER_TEMP/new.tsv" | tr -d ' ')"
+          releases="$(jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {repo: .[0], tag: .[1]})' "$RUNNER_TEMP/new.tsv")"
+
+          echo "Hittade $count release(r):"
+          cat "$RUNNER_TEMP/new.tsv"
+          {
+            echo "count=$count"
+            echo "releases=$releases"
+          } >> "$GITHUB_OUTPUT"
+
+  intake:
+    needs: find
+    if: needs.find.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.find.outputs.releases) }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/maven-intake.yaml
+    with:
+      repo: ${{ matrix.repo }}
+      tag: ${{ matrix.tag }}
