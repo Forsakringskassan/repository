@@ -17,13 +17,13 @@ name: Maven intake (schemalagt)
 
 on:
   schedule:
-    - cron: "17,47 * * * *"
+    - cron: "2,17,32,47 * * * *"
   workflow_dispatch:
     inputs:
       since-hours:
         description: "Ta in releaser publicerade de senaste N timmarna"
         required: true
-        default: "2"
+        default: "24"
       repo-filter:
         description: "Regex på reponamn som får vara källor"
         required: true
