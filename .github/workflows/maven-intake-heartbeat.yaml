@@ -1,0 +1,55 @@
+name: Maven intake (hjärtslag)
+
+# Startar uppsamlingen (maven-intake-schedule.yaml) var 15:e minut under
+# kontorstid, så att fördröjningen inte beror på när GitHub kör schemat. Varje
+# körning pågår högst 5,5 timmar, och dagen slutar 17:45 svensk tid. Flera
+# starttider gör att ett hjärtslag som GitHub hoppar över tas över av nästa.
+# Starttider som kommer medan ett hjärtslag pågår väntar i concurrency-kön.
+#
+# Uppsamlingens eget schema körs under samma tider och tar över om
+# hjärtslaget uteblir. Kvällar och helger körs ingenting, och releaser från
+# den tiden tas in vid första körningen nästa vardag. Ingenting går förlorat,
+# det blir bara längre fördröjning.
+#
+# Obs: GitHub stänger av schemalagda workflows efter 60 dagar utan aktivitet i
+# repot. Starta workflowet manuellt eller gör en commit om det har stängts av.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7,10,13,16 * * 1-5"
+      timezone: "Europe/Stockholm"
+
+permissions:
+  actions: write
+
+concurrency:
+  group: maven-intake-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - name: Trigger intake every 15 minutes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          now="$(date -u +%s)"
+          end=$(( now + 330 * 60 ))
+          day_end="$(TZ=Europe/Stockholm date -d "today 17:45" +%s)"
+          [ "$day_end" -lt "$end" ] && end=$day_end
+
+          if [ "$now" -ge "$end" ]; then
+            echo "Dagens fönster är slut, avslutar."
+            exit 0
+          fi
+          echo "Hjärtslag till $(TZ=Europe/Stockholm date -d "@$end" +%H:%M) svensk tid"
+
+          while :; do
+            gh workflow run maven-intake-schedule.yaml -R "$GITHUB_REPOSITORY" \
+              || echo "::warning::Kunde inte starta intaget"
+            [ $(( $(date -u +%s) + 900 )) -lt "$end" ] || break
+            sleep 900
+          done
