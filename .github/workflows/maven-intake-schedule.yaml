@@ -1,33 +1,31 @@
 name: Maven intake (schemalagt)
 
-# Letar var 15:e minut efter releaser i organisationen som har en
-# maven-staging.tar.gz och publicerats den senaste tiden, och kör
-# maven-intake.yaml för var och en. Intaget hoppar över versioner som redan
+# Letar efter releaser i organisationen som har en maven-staging.tar.gz och
+# kör maven-intake.yaml för var och en. Körs var 15:e minut under kontorstid,
+# både av schemat nedan och av maven-intake-heartbeat.yaml. Varje körning
+# fortsätter där senaste lyckade körning skapades, så releaser tas in även om
+# GitHub hoppar över körningar, och releaser från kvällar och helger tas in
+# vid första körningen nästa vardag. Intaget hoppar över versioner som redan
 # finns, så det gör inget om samma release ses i flera körningar.
-#
-# Ingen behöver starta intaget för hand, och ingen utanför plattformen behöver
-# skrivrätt i detta repo.
 #
 # Bara repon vars namn matchar REPO_FILTER blir källor. Utöka filtret när nya
 # team ansluts. På sikt ersätts det av custom propertyn "team" och av
 # verifiering av attesteringar.
+#
+# Workflowet har inga inputs. Om varje körning täcker hela tiden sedan förra
+# lyckade körning blir den alltid en säker startpunkt. Releaser som ligger före
+# startpunkten, till exempel när ett nytt repo läggs till i REPO_FILTER, tas in
+# genom att köra maven-intake.yaml direkt med repo och tagg.
 #
 # Obs: GitHub stänger av schemalagda workflows efter 60 dagar utan aktivitet i
 # repot. Starta workflowet manuellt eller gör en commit om det har stängts av.
 
 on:
   schedule:
-    - cron: "2,17,32,47 * * * *"
+    # Var 15:e minut 07:07–17:52 svensk tid, vardagar.
+    - cron: "7,22,37,52 7-17 * * 1-5"
+      timezone: "Europe/Stockholm"
   workflow_dispatch:
-    inputs:
-      since-hours:
-        description: "Ta in releaser publicerade de senaste N timmarna"
-        required: true
-        default: "24"
-      repo-filter:
-        description: "Regex på reponamn som får vara källor"
-        required: true
-        default: "^rimfrost-"
 
 permissions:
   contents: read
@@ -39,6 +37,9 @@ concurrency:
 jobs:
   find:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       releases: ${{ steps.find.outputs.releases }}
       count: ${{ steps.find.outputs.count }}
@@ -48,11 +49,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: Forsakringskassan
-          SINCE_HOURS: ${{ inputs.since-hours || '3' }}
-          REPO_FILTER: ${{ inputs.repo-filter || '^rimfrost-' }}
+          REPO_FILTER: "^rimfrost-"
+          # Marginal bakåt från förra lyckade körningens skapande, och tak för hur
+          # långt bakåt vi går.
+          MARGIN_MINUTES: "15"
+          MAX_HOURS: "336"
         run: |
-          [[ "$SINCE_HOURS" =~ ^[0-9]+$ ]] || { echo "::error::Ogiltigt antal timmar"; exit 1; }
-          cutoff="$(date -u -d "-${SINCE_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)"
+          now="$(date -u +%s)"
+          max_cutoff=$(( now - MAX_HOURS * 3600 ))
+
+          # Fortsätt där senaste lyckade körning skapades. Alla körningar täcker
+          # hela tiden sedan dess, så den är alltid en säker startpunkt.
+          last="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/maven-intake-schedule.yaml/runs?status=success&per_page=1" \
+            --jq '.workflow_runs[0].created_at // empty')"
+          if [ -n "$last" ]; then
+            cutoff_s=$(( $(date -u -d "$last" +%s) - MARGIN_MINUTES * 60 ))
+            echo "Senaste lyckade körning skapades $last"
+          else
+            echo "::warning::Ingen tidigare lyckad körning, går tillbaka $MAX_HOURS timmar"
+            cutoff_s=$max_cutoff
+          fi
+
+          if [ "$cutoff_s" -lt "$max_cutoff" ]; then
+            echo "::warning::Fönstret är längre än $MAX_HOURS timmar, begränsar. Kontrollera om intaget har fallerat länge."
+            cutoff_s=$max_cutoff
+          fi
+
+          cutoff="$(date -u -d "@$cutoff_s" +%Y-%m-%dT%H:%M:%SZ)"
           echo "Letar efter releaser publicerade efter $cutoff"
 
           # En GraphQL-fråga per 50 repon, i stället för ett anrop per repo.
@@ -61,13 +85,14 @@ jobs:
           # shellcheck disable=SC2016
           gh api graphql --paginate -F owner="$OWNER" -f query='
             query($owner: String!, $endCursor: String) {
+              rateLimit { cost remaining resetAt }
               organization(login: $owner) {
                 repositories(first: 50, after: $endCursor) {
                   pageInfo { hasNextPage endCursor }
                   nodes {
                     name
                     isArchived
-                    releases(first: 5, orderBy: {field: CREATED_AT, direction: DESC}) {
+                    releases(first: 20, orderBy: {field: CREATED_AT, direction: DESC}) {
                       nodes {
                         tagName
                         publishedAt
@@ -78,14 +103,26 @@ jobs:
                   }
                 }
               }
-            }' --jq '
+            }' > "$RUNNER_TEMP/pages.json"
+
+          # Kostnad per sida och kvarvarande budget, för att se om frågan
+          # närmar sig gränsen.
+          # shellcheck disable=SC2016
+          jq -r '.data.rateLimit | "GraphQL-sida: kostnad \(.cost), kvar \(.remaining), nollställs \(.resetAt)"' \
+            "$RUNNER_TEMP/pages.json"
+          jq -s -r '"GraphQL totalt: \(map(.data.rateLimit.cost) | add) poäng, kvar \(last.data.rateLimit.remaining)"' \
+            "$RUNNER_TEMP/pages.json"
+
+          # shellcheck disable=SC2016
+          jq -r '
             .data.organization.repositories.nodes[]
             | select(.isArchived | not)
             | .name as $repo
             | .releases.nodes[]
             | select((.isDraft | not) and .publishedAt != null)
             | select([.releaseAssets.nodes[].name] | index("maven-staging.tar.gz"))
-            | [$repo, .tagName, .publishedAt] | @tsv' > "$RUNNER_TEMP/candidates.tsv"
+            | [$repo, .tagName, .publishedAt] | @tsv' \
+            "$RUNNER_TEMP/pages.json" > "$RUNNER_TEMP/candidates.tsv"
 
           # Bara tillåtna repon, och bara releaser efter gränsen.
           # ISO 8601-tider i UTC går att jämföra som text.
